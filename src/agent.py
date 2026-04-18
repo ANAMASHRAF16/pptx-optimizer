@@ -1,24 +1,24 @@
 """
-PPTX Editing Agent — Baseline version (slow, sequential).
+PPTX Editing Agent — FIXED version (fast, parallel, cached, with fallback).
 
-Takes a slide JSON, runs 3 steps through Claude:
-1. Analyze — identify layout, find text issues
-2. Transform — rewrite text to be professional
-3. Validate — check nothing was broken
-
-Problems:
-- All 3 calls run sequentially (~6-8s total)
-- No prompt caching (system prompt sent fresh every call)
-- No fallback model (if Sonnet fails, everything fails)
+Fixes:
+1. Analyze + Transform run in PARALLEL (they don't depend on each other)
+2. System prompt uses prompt caching (sent once, reused across calls)
+3. Fallback model: if Sonnet fails/times out, retry with Haiku
+4. Target latency: <3 seconds per slide
 """
 
 import json
 import time
+import concurrent.futures
 import anthropic
 
 client = anthropic.Anthropic()
-MODEL = "claude-sonnet-4-20250514"
 
+PRIMARY_MODEL = "claude-sonnet-4-20250514"
+FALLBACK_MODEL = "claude-haiku-4-5-20251001"
+
+# Same system prompt, but will be sent with cache_control for prompt caching
 SYSTEM_PROMPT = """You are a PowerPoint slide editing assistant.
 You work with slide data in JSON format. Each slide has shapes with properties like:
 - text: the text content
@@ -36,40 +36,90 @@ SAMPLE_SLIDE = {
         {
             "id": "title_1",
             "text": "Q4 sales r up big time!!!",
-            "x": 50, "y": 30, "width": 800, "height": 60,
-            "font_size": 28, "font_color": "#000000", "bg_color": None,
+            "x": 50,
+            "y": 30,
+            "width": 800,
+            "height": 60,
+            "font_size": 28,
+            "font_color": "#000000",
+            "bg_color": None,
         },
         {
             "id": "subtitle_1",
             "text": "we made alot of $$ this quarter, heres the numbers",
-            "x": 50, "y": 100, "width": 800, "height": 40,
-            "font_size": 18, "font_color": "#666666", "bg_color": None,
+            "x": 50,
+            "y": 100,
+            "width": 800,
+            "height": 40,
+            "font_size": 18,
+            "font_color": "#666666",
+            "bg_color": None,
         },
         {
             "id": "body_1",
             "text": "Revenue: $4.2M (up 23%)\nNew customers: 340\nChurn: down to 2.1%\nTop region: North America",
-            "x": 50, "y": 160, "width": 400, "height": 300,
-            "font_size": 14, "font_color": "#333333", "bg_color": "#F5F5F5",
+            "x": 50,
+            "y": 160,
+            "width": 400,
+            "height": 300,
+            "font_size": 14,
+            "font_color": "#333333",
+            "bg_color": "#F5F5F5",
         },
         {
             "id": "footer_1",
             "text": "confidential - do not share",
-            "x": 50, "y": 500, "width": 800, "height": 30,
-            "font_size": 10, "font_color": "#999999", "bg_color": None,
+            "x": 50,
+            "y": 500,
+            "width": 800,
+            "height": 30,
+            "font_size": 10,
+            "font_color": "#999999",
+            "bg_color": None,
         },
     ],
 }
 
 
-def call_claude(user_prompt):
-    """Make a single Claude call. No caching, no fallback."""
-    response = client.messages.create(
-        model=MODEL,
-        max_tokens=1024,
-        system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": user_prompt}],
-    )
-    return response.content[0].text
+def call_claude(user_prompt, use_fallback=True):
+    """
+    Make a Claude call with:
+    - Prompt caching (system prompt cached via cache_control)
+    - Fallback model (if primary fails, try fallback)
+    """
+    # FIX: Prompt caching — tell Claude to cache the system prompt
+    # First call pays full cost, subsequent calls reuse the cached prompt
+    system_with_cache = [
+        {
+            "type": "text",
+            "text": SYSTEM_PROMPT,
+            "cache_control": {"type": "ephemeral"},
+        }
+    ]
+
+    try:
+        # Try primary model first
+        response = client.messages.create(
+            model=PRIMARY_MODEL,
+            max_tokens=1024,
+            system=system_with_cache,
+            messages=[{"role": "user", "content": user_prompt}],
+        )
+        return response.content[0].text
+
+    except Exception as e:
+        if not use_fallback:
+            raise
+
+        # FIX: Fallback model — if Sonnet fails, try Haiku
+        print(f"  Primary model failed ({e}), falling back to Haiku...")
+        response = client.messages.create(
+            model=FALLBACK_MODEL,
+            max_tokens=1024,
+            system=system_with_cache,
+            messages=[{"role": "user", "content": user_prompt}],
+        )
+        return response.content[0].text
 
 
 def analyze_slide(slide_json):
@@ -83,6 +133,7 @@ def analyze_slide(slide_json):
 
 Slide:
 {json.dumps(slide_json, indent=2)}"""
+
     return call_claude(prompt)
 
 
@@ -95,6 +146,7 @@ Keep all other properties (x, y, width, height, colors) exactly the same.
 
 Slide:
 {json.dumps(slide_json, indent=2)}"""
+
     return call_claude(prompt)
 
 
@@ -115,29 +167,33 @@ Original:
 
 Transformed:
 {transformed_json}"""
+
     return call_claude(prompt)
 
 
 def run(slide=None):
-    """Run the full pipeline SEQUENTIALLY."""
+    """Run the full pipeline with PARALLEL calls where possible."""
     if slide is None:
         slide = SAMPLE_SLIDE
 
     start = time.time()
 
-    # Step 1: Analyze (blocks until done)
-    print("Step 1: Analyzing slide...")
+    # FIX: Steps 1 and 2 run in PARALLEL (they don't depend on each other)
+    # Before: Analyze(2s) → Transform(2s) → Validate(2s) = 6s
+    # After:  Analyze(2s) + Transform(2s) in parallel → Validate(1s) = 3s
+    print("Steps 1+2: Analyzing and transforming in parallel...")
     t1 = time.time()
-    analysis = analyze_slide(slide)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        analyze_future = executor.submit(analyze_slide, slide)
+        transform_future = executor.submit(transform_slide, slide)
+
+        analysis = analyze_future.result()
+        transformed = transform_future.result()
+
     print(f"  Done in {time.time() - t1:.1f}s")
 
-    # Step 2: Transform (waits for Step 1, even though it doesn't need its output)
-    print("Step 2: Transforming slide...")
-    t2 = time.time()
-    transformed = transform_slide(slide)
-    print(f"  Done in {time.time() - t2:.1f}s")
-
-    # Step 3: Validate (needs Step 2's output)
+    # Step 3: Validate (needs transform output, so must run after)
     print("Step 3: Validating output...")
     t3 = time.time()
     validation = validate_output(slide, transformed)
